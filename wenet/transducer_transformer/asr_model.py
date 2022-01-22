@@ -27,7 +27,7 @@ from wenet.transformer.encoder import ConformerEncoder
 from wenet.transformer.encoder import TransformerEncoder
 from wenet.transformer.label_smoothing_loss import LabelSmoothingLoss
 from wenet.transducer_transformer.rnnt.model import JointNet
-from wenet.transducer_transformer.rnnt.decoder import build_decoder
+from wenet.transducer_transformer.rnnt.decoder import BaseDecoder
 from warprnnt_pytorch import RNNTLoss
 from wenet.utils.cmvn import load_cmvn
 from wenet.utils.common import (IGNORE_ID, add_sos_eos, log_add,
@@ -64,7 +64,7 @@ class ASRModel(torch.nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         # build_decoder(hidden_size, vocab_size, output_size, n_layers, dropout=0.2, share_weight=False)
-        self.transducer_decoder = build_decoder(512, vocab_size, 512, 1, dropout=0.2, share_weight=False)
+        self.transducer_decoder = BaseDecoder(512, vocab_size, 512, 1, dropout=0.2, share_weight=False)
         self.joint = JointNet(512, 1024, vocab_size)
         self.criterion_transducer = RNNTLoss()
         self.criterion_att = LabelSmoothingLoss(
@@ -112,7 +112,7 @@ class ASRModel(torch.nn.Module):
             concat_targets = F.pad(text, pad=(1, 0, 0, 0), value=0)
             dec_state, _ = self.transducer_decoder(concat_targets, text_lengths.add(1))
             logits = self.joint(enc_state, dec_state)
-            loss_transducer = self.crit(logits, text.int(), speech_lengths.int(), text_lengths.int())
+            loss_transducer = self.criterion_transducer(logits, text.int(), speech_lengths.int(), text_lengths.int())
         else:
             loss_transducer = None
 
@@ -335,6 +335,26 @@ class ASRModel(torch.nn.Module):
         hyps = [remove_duplicates_and_blank(hyp) for hyp in hyps]
         return hyps, scores
 
+    def rnnt_decode(self,speech , enc_state, lengths):
+        token_list = []
+        zero_token = torch.LongTensor([[0]])
+        if speech.is_cuda:
+            zero_token = zero_token.cuda()
+        dec_state, hidden = self.transducer_decoder(zero_token)
+        for t in range(lengths):
+            logits = self.joint(enc_state[t].view(-1), dec_state.view(-1))
+            out = F.softmax(logits, dim=0).detach()
+            pred = torch.argmax(out, dim=0)
+            pred = int(pred.item())
+            if pred != 0:
+                token_list.append(pred)
+                token = torch.LongTensor([[pred]])
+                if enc_state.is_cuda:
+                    token = token.cuda()
+                dec_state, hidden = self.decoder(token, hidden=hidden)
+        score = F.softmax(self.joint(enc_state[lengths - 1].view(-1), dec_state.view(-1)), dim=0).detach()
+        return token_list, score
+
     def rnnt_greedy_search(
         self,
         speech: torch.Tensor,
@@ -369,31 +389,10 @@ class ASRModel(torch.nn.Module):
             simulate_streaming)  # (B, maxlen, encoder_dim)
         maxlen = encoder_out.size(1)
         encoder_out_lens = encoder_mask.squeeze(1).sum(1)
-
-        zero_token = torch.LongTensor([[0]])
-        if speech.is_cuda:
-            zero_token = zero_token.cuda()
-
-        def decode(enc_state, lengths):
-            token_list = []
-            dec_state, hidden = self.transducer_decoder(zero_token)
-            for t in range(lengths):
-                logits = self.joint(enc_state[t].view(-1), dec_state.view(-1))
-                out = F.softmax(logits, dim=0).detach()
-                pred = torch.argmax(out, dim=0)
-                pred = int(pred.item())
-                if pred != 0:
-                    token_list.append(pred)
-                    token = torch.LongTensor([[pred]])
-                    if enc_state.is_cuda:
-                        token = token.cuda()
-                    dec_state, hidden = self.decoder(token, hidden=hidden)
-            score = F.softmax(self.joint(enc_state[lengths-1].view(-1), dec_state.view(-1)), dim=0).detach()
-            return token_list, score
-
+        # calculate batch rnnt scores
         results, scores = [], []
         for i in range(batch_size):
-            decoded_seq, score_seq = decode(encoder_out[i], speech_lengths[i])
+            decoded_seq, score_seq = self.rnnt_decode(speech, encoder_out[i], speech_lengths[i])
             results.append(decoded_seq)
             scores.append(score_seq)
         topk_prob = scores.topk(1, dim=2)
@@ -401,6 +400,94 @@ class ASRModel(torch.nn.Module):
         scores_result = topk_prob.max(1)
         hyps = [remove_duplicates_and_blank(hyp) for hyp in hyps]
         return hyps, scores_result
+
+    def _rnnt_prefix_beam_search(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        beam_size: int,
+        decoding_chunk_size: int = -1,
+        num_decoding_left_chunks: int = -1,
+        simulate_streaming: bool = False,
+    ) -> Tuple[List[List[int]], torch.Tensor]:
+        """ rnnt prefix beam search inner implementation
+
+        Args:
+            speech (torch.Tensor): (batch, max_len, feat_dim)
+            speech_length (torch.Tensor): (batch, )
+            beam_size (int): beam size for beam search
+            decoding_chunk_size (int): decoding chunk for dynamic chunk
+                trained model.
+                <0: for decoding, use full chunk.
+                >0: for decoding, use fixed chunk size as set.
+                0: used for training, it's prohibited here
+            simulate_streaming (bool): whether do encoder forward in a
+                streaming fashion
+
+        Returns:
+            List[List[int]]: nbest results
+            torch.Tensor: encoder output, (1, max_len, encoder_dim),
+                it will be used for rescoring in attention rescoring mode
+        """
+        assert speech.shape[0] == speech_lengths.shape[0]
+        assert decoding_chunk_size != 0
+        batch_size = speech.shape[0]
+        # For rnnt prefix beam search, we only support batch_size=1
+        assert batch_size == 1
+        # Let's assume B = batch_size and N = beam_size
+        # 1. Encoder forward and get rnnt score
+        encoder_out, encoder_mask = self._forward_encoder(
+            speech, speech_lengths, decoding_chunk_size,
+            num_decoding_left_chunks,
+            simulate_streaming)  # (B, maxlen, encoder_dim)
+        maxlen = encoder_out.size(1)
+        results, rnnt_probs = [], []
+        for i in range(batch_size):
+            decoded_seq, score_seq = self.rnnt_decode(speech, encoder_out[i], speech_lengths[i])
+            results.append(decoded_seq)
+            rnnt_probs.append(score_seq)
+        rnnt_probs = rnnt_probs.squeeze(0)
+        # cur_hyps: (prefix, (blank_ending_score, none_blank_ending_score))
+        cur_hyps = [(tuple(), (0.0, -float('inf')))]
+        # 2. CTC beam search step by step
+        for t in range(0, maxlen):
+            logp = rnnt_probs[t]  # (vocab_size,)
+            # key: prefix, value (pb, pnb), default value(-inf, -inf)
+            next_hyps = defaultdict(lambda: (-float('inf'), -float('inf')))
+            # 2.1 First beam prune: select topk best
+            top_k_logp, top_k_index = logp.topk(beam_size)  # (beam_size,)
+            for s in top_k_index:
+                s = s.item()
+                ps = logp[s].item()
+                for prefix, (pb, pnb) in cur_hyps:
+                    last = prefix[-1] if len(prefix) > 0 else None
+                    if s == 0:  # blank
+                        n_pb, n_pnb = next_hyps[prefix]
+                        n_pb = log_add([n_pb, pb + ps, pnb + ps])
+                        next_hyps[prefix] = (n_pb, n_pnb)
+                    elif s == last:
+                        #  Update *ss -> *s;
+                        n_pb, n_pnb = next_hyps[prefix]
+                        n_pnb = log_add([n_pnb, pnb + ps])
+                        next_hyps[prefix] = (n_pb, n_pnb)
+                        # Update *s-s -> *ss, - is for blank
+                        n_prefix = prefix + (s, )
+                        n_pb, n_pnb = next_hyps[n_prefix]
+                        n_pnb = log_add([n_pnb, pb + ps])
+                        next_hyps[n_prefix] = (n_pb, n_pnb)
+                    else:
+                        n_prefix = prefix + (s, )
+                        n_pb, n_pnb = next_hyps[n_prefix]
+                        n_pnb = log_add([n_pnb, pb + ps, pnb + ps])
+                        next_hyps[n_prefix] = (n_pb, n_pnb)
+
+            # 2.2 Second beam prune
+            next_hyps = sorted(next_hyps.items(),
+                               key=lambda x: log_add(list(x[1])),
+                               reverse=True)
+            cur_hyps = next_hyps[:beam_size]
+        hyps = [(y[0], log_add([y[1][0], y[1][1]])) for y in cur_hyps]
+        return hyps, encoder_out
 
     def _ctc_prefix_beam_search(
         self,
@@ -519,6 +606,38 @@ class ASRModel(torch.nn.Module):
                                                simulate_streaming)
         return hyps[0]
 
+    def rnnt_prefix_beam_search(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        beam_size: int,
+        decoding_chunk_size: int = -1,
+        num_decoding_left_chunks: int = -1,
+        simulate_streaming: bool = False,
+    ) -> List[int]:
+        """ Apply rnnt prefix beam search
+
+        Args:
+            speech (torch.Tensor): (batch, max_len, feat_dim)
+            speech_length (torch.Tensor): (batch, )
+            beam_size (int): beam size for beam search
+            decoding_chunk_size (int): decoding chunk for dynamic chunk
+                trained model.
+                <0: for decoding, use full chunk.
+                >0: for decoding, use fixed chunk size as set.
+                0: used for training, it's prohibited here
+            simulate_streaming (bool): whether do encoder forward in a
+                streaming fashion
+
+        Returns:
+            List[int]: rnnt prefix beam search nbest results
+        """
+        hyps, _ = self._rnnt_prefix_beam_search(speech, speech_lengths,
+                                               beam_size, decoding_chunk_size,
+                                               num_decoding_left_chunks,
+                                               simulate_streaming)
+        return hyps[0]
+
     def attention_rescoring(
         self,
         speech: torch.Tensor,
@@ -526,11 +645,11 @@ class ASRModel(torch.nn.Module):
         beam_size: int,
         decoding_chunk_size: int = -1,
         num_decoding_left_chunks: int = -1,
-        ctc_weight: float = 0.0,
+        rnnt_weight: float = 0.0,
         simulate_streaming: bool = False,
         reverse_weight: float = 0.0,
     ) -> List[int]:
-        """ Apply attention rescoring decoding, CTC prefix beam search
+        """ Apply attention rescoring decoding, rnnt prefix beam search
             is applied first to get nbest, then we resoring the nbest on
             attention decoder with corresponding encoder out
 
@@ -546,7 +665,7 @@ class ASRModel(torch.nn.Module):
             simulate_streaming (bool): whether do encoder forward in a
                 streaming fashion
             reverse_weight (float): right to left decoder weight
-            ctc_weight (float): ctc score weight
+            rnnt_weight (float): rnnt score weight
 
         Returns:
             List[int]: Attention rescoring result
@@ -561,7 +680,7 @@ class ASRModel(torch.nn.Module):
         # For attention rescoring we only support batch_size=1
         assert batch_size == 1
         # encoder_out: (1, maxlen, encoder_dim), len(hyps) = beam_size
-        hyps, encoder_out = self._ctc_prefix_beam_search(
+        hyps, encoder_out = self._rnnt_prefix_beam_search(
             speech, speech_lengths, beam_size, decoding_chunk_size,
             num_decoding_left_chunks, simulate_streaming)
 
@@ -610,8 +729,8 @@ class ASRModel(torch.nn.Module):
                     r_score += r_decoder_out[i][len(hyp[0]) - j - 1][w]
                 r_score += r_decoder_out[i][len(hyp[0])][self.eos]
                 score = score * (1 - reverse_weight) + r_score * reverse_weight
-            # add ctc score
-            score += hyp[1] * ctc_weight
+            # add rnnt score
+            score += hyp[1] * rnnt_weight
             if score > best_score:
                 best_score = score
                 best_index = i
